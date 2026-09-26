@@ -38,6 +38,8 @@ public sealed class AdjacentSidecarsBuilder
     private PostgresSidecar? _postgres;
     private AzuriteSidecar? _azurite;
     private ServiceBusEmulatorSidecar? _serviceBus;
+    private bool _perWorker = true;
+    private string? _workerScopeId;
 
     /// <summary>
     /// Override the <c>docker compose</c> project name (default <c>tamp-sidecars</c>).
@@ -49,6 +51,28 @@ public sealed class AdjacentSidecarsBuilder
         if (string.IsNullOrWhiteSpace(name))
             throw new ArgumentException("project name must not be empty.", nameof(name));
         _projectName = name;
+        return this;
+    }
+
+    /// <summary>
+    /// #18 parallel-safety (correct-by-default): when enabled (default), the compose project name is
+    /// suffixed with a per-worker discriminator and non-overridden host ports are shifted into this
+    /// worker's port band, so N worktrees can provision the same sidecar set concurrently without
+    /// name/port collisions. Disable for a deliberately shared / fixed-port set-up.
+    /// </summary>
+    public AdjacentSidecarsBuilder WithPerWorker(bool on = true)
+    {
+        _perWorker = on;
+        return this;
+    }
+
+    /// <summary>Pin the per-worker discriminator explicitly (implies per-worker on). Default auto-resolves via <c>TAMP_WORKER_ID</c> → worktree hash.</summary>
+    public AdjacentSidecarsBuilder WithWorkerScope(string discriminator)
+    {
+        if (string.IsNullOrWhiteSpace(discriminator))
+            throw new ArgumentException("worker scope must not be empty.", nameof(discriminator));
+        _workerScopeId = discriminator;
+        _perWorker = true;
         return this;
     }
 
@@ -86,9 +110,23 @@ public sealed class AdjacentSidecarsBuilder
             throw new InvalidOperationException(
                 "At least one sidecar must be configured (call WithPostgres / WithAzurite / WithServiceBusEmulator).");
 
-        var yaml = ComposeWriter.Write(_projectName, _postgres, _azurite, _serviceBus);
+        // #18: derive the per-worker discriminator + port band; suffix the project name and shift
+        // non-overridden host ports so parallel worktrees don't collide. Idempotent across Build()s.
+        var scope = _perWorker ? (_workerScopeId ?? WorkerScope.Discriminator()) : null;
+        if (string.IsNullOrWhiteSpace(scope)) scope = null;
+
+        var effectiveProjectName = scope is null ? _projectName : $"{_projectName}-{scope}";
+        if (scope is not null)
+        {
+            var offset = WorkerScope.PortOffset(scope);
+            _postgres?.ApplyWorkerPortOffset(offset);
+            _azurite?.ApplyWorkerPortOffset(offset);
+            _serviceBus?.ApplyWorkerPortOffset(offset);
+        }
+
+        var yaml = ComposeWriter.Write(effectiveProjectName, _postgres, _azurite, _serviceBus);
         var env = EnvWriter.Build(_postgres, _azurite, _serviceBus);
-        return new AdjacentSidecarsSpec(_projectName, yaml, env);
+        return new AdjacentSidecarsSpec(effectiveProjectName, yaml, env);
     }
 }
 
@@ -139,8 +177,12 @@ public sealed class AdjacentSidecarsSpec
 /// <summary>Postgres sidecar configuration. Default <c>postgres:16-alpine</c> on port 5432.</summary>
 public sealed class PostgresSidecar
 {
+    private int _hostPort = 5432;
+    private bool _hostPortExplicit;
+    private bool _offsetApplied;
+
     public string Image { get; set; } = "postgres:16-alpine";
-    public int HostPort { get; set; } = 5432;
+    public int HostPort { get => _hostPort; set { _hostPort = value; _hostPortExplicit = true; } }
     public string Database { get; set; } = "tamp_test";
     public string Username { get; set; } = "tamp";
     public string Password { get; set; } = "tamp";
@@ -153,6 +195,14 @@ public sealed class PostgresSidecar
     public PostgresSidecar WithPassword(string pwd) { Password = pwd; return this; }
     public PostgresSidecar WithServiceName(string name) { ServiceName = name; return this; }
 
+    /// <summary>#18: shift the (non-overridden) host port into this worker's band. Idempotent.</summary>
+    internal void ApplyWorkerPortOffset(int offset)
+    {
+        if (_offsetApplied) return;
+        _offsetApplied = true;
+        if (!_hostPortExplicit) _hostPort += offset;
+    }
+
     internal string ConnectionString() =>
         $"Host=localhost;Port={HostPort};Database={Database};Username={Username};Password={Password}";
 }
@@ -160,10 +210,16 @@ public sealed class PostgresSidecar
 /// <summary>Azurite sidecar configuration. Default <c>mcr.microsoft.com/azure-storage/azurite:latest</c>, blob:10000 / queue:10001 / table:10002.</summary>
 public sealed class AzuriteSidecar
 {
+    private int _blobPort = 10000;
+    private int _queuePort = 10001;
+    private int _tablePort = 10002;
+    private bool _blobExplicit, _queueExplicit, _tableExplicit;
+    private bool _offsetApplied;
+
     public string Image { get; set; } = "mcr.microsoft.com/azure-storage/azurite:latest";
-    public int BlobPort { get; set; } = 10000;
-    public int QueuePort { get; set; } = 10001;
-    public int TablePort { get; set; } = 10002;
+    public int BlobPort { get => _blobPort; set { _blobPort = value; _blobExplicit = true; } }
+    public int QueuePort { get => _queuePort; set { _queuePort = value; _queueExplicit = true; } }
+    public int TablePort { get => _tablePort; set { _tablePort = value; _tableExplicit = true; } }
     public string ServiceName { get; set; } = "azurite";
 
     public AzuriteSidecar WithImage(string image) { Image = image; return this; }
@@ -171,6 +227,16 @@ public sealed class AzuriteSidecar
     public AzuriteSidecar WithQueuePort(int port) { QueuePort = port; return this; }
     public AzuriteSidecar WithTablePort(int port) { TablePort = port; return this; }
     public AzuriteSidecar WithServiceName(string name) { ServiceName = name; return this; }
+
+    /// <summary>#18: shift the (non-overridden) host ports into this worker's band. Idempotent.</summary>
+    internal void ApplyWorkerPortOffset(int offset)
+    {
+        if (_offsetApplied) return;
+        _offsetApplied = true;
+        if (!_blobExplicit) _blobPort += offset;
+        if (!_queueExplicit) _queuePort += offset;
+        if (!_tableExplicit) _tablePort += offset;
+    }
 
     // Azurite's default account is well-known and documented in the image:
     // https://learn.microsoft.com/en-us/azure/storage/common/storage-use-azurite#well-known-storage-account-and-key
@@ -190,8 +256,12 @@ public sealed class AzuriteSidecar
 /// <summary>Service Bus emulator sidecar. Default <c>mcr.microsoft.com/azure-messaging/servicebus-emulator:latest</c> on port 5672.</summary>
 public sealed class ServiceBusEmulatorSidecar
 {
+    private int _hostPort = 5672;
+    private bool _hostPortExplicit;
+    private bool _offsetApplied;
+
     public string Image { get; set; } = "mcr.microsoft.com/azure-messaging/servicebus-emulator:latest";
-    public int HostPort { get; set; } = 5672;
+    public int HostPort { get => _hostPort; set { _hostPort = value; _hostPortExplicit = true; } }
     public string ServiceName { get; set; } = "servicebus";
     /// <summary>
     /// Optional path to a Service Bus emulator config file (<c>Config.json</c>). When set,
@@ -204,6 +274,14 @@ public sealed class ServiceBusEmulatorSidecar
     public ServiceBusEmulatorSidecar WithHostPort(int port) { HostPort = port; return this; }
     public ServiceBusEmulatorSidecar WithServiceName(string name) { ServiceName = name; return this; }
     public ServiceBusEmulatorSidecar WithConfigJson(string path) { ConfigJsonPath = path; return this; }
+
+    /// <summary>#18: shift the (non-overridden) host port into this worker's band. Idempotent.</summary>
+    internal void ApplyWorkerPortOffset(int offset)
+    {
+        if (_offsetApplied) return;
+        _offsetApplied = true;
+        if (!_hostPortExplicit) _hostPort += offset;
+    }
 
     internal string ConnectionString() =>
         $"Endpoint=sb://localhost:{HostPort}/;" +
